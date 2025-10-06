@@ -1,6 +1,5 @@
 gradio==4.44.0
 openai>=1.30.0
 pypdf==4.3.1
-sentence-transformers==3.0.1
 scikit-learn==1.5.1
-numpy>=1.26  # ok with sklearn
+numpy>=1.26
