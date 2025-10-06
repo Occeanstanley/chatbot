@@ -1,4 +1,5 @@
-# app.py — Gradio + OpenAI chatbot with PDF RAG (Lite: OpenAI embeddings + sklearn)
+# app.py — Windows-friendly Gradio chatbot with optional PDF RAG
+# Uses OpenAI embeddings + scikit-learn NearestNeighbors (no FAISS)
 
 import os
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ def get_client():
     return OpenAI(api_key=key)
 
 # ---------- Embeddings & store ----------
-EMBED_MODEL = "text-embedding-3-small"  # cheap + fast
+EMBED_MODEL = "text-embedding-3-small"  # fast + inexpensive
 
 @dataclass
 class VectorStore:
@@ -44,20 +45,19 @@ def _chunk(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
     return out
 
 def _embed_texts(texts: List[str]) -> np.ndarray:
+    """Embed a list of texts with OpenAI and L2-normalize for cosine similarity."""
     if not texts:
         return np.zeros((0, 1536), dtype="float32")
     client = get_client()
     out = []
-    # embed in small batches to avoid token limits
     B = 64
     for i in range(0, len(texts), B):
         batch = texts[i:i+B]
         resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
         vecs = [np.array(d.embedding, dtype="float32") for d in resp.data]
         out.extend(vecs)
-    # normalize for cosine similarity
     X = np.vstack(out)
-    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
     return X
 
 def build_index_from_pdfs(files: List[gr.File]) -> str:
