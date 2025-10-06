@@ -1,4 +1,4 @@
-# app.py — Gradio + OpenAI chatbot with PDF RAG (Windows-friendly: sklearn instead of FAISS)
+# app.py — Gradio + OpenAI chatbot with PDF RAG (Lite: OpenAI embeddings + sklearn)
 
 import os
 from dataclasses import dataclass
@@ -7,10 +7,9 @@ from typing import List, Tuple, Optional
 import gradio as gr
 import numpy as np
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 from sklearn.neighbors import NearestNeighbors
 
-# ----- API key helpers -----
+# ---------- API key ----------
 def set_api_key_from_textbox(k: str) -> str:
     k = (k or "").strip()
     if k:
@@ -22,25 +21,19 @@ def get_client():
     from openai import OpenAI
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise ValueError("OPENAI_API_KEY not set. Paste it in the UI or set env var.")
+        raise ValueError("OPENAI_API_KEY not set. Paste it in the UI or export the env var.")
     return OpenAI(api_key=key)
 
-# ----- RAG store (SentenceTransformer + sklearn KNN) -----
-EMB_MODEL_NAME = "all-MiniLM-L6-v2"
-_embedder: Optional[SentenceTransformer] = None
+# ---------- Embeddings & store ----------
+EMBED_MODEL = "text-embedding-3-small"  # cheap + fast
 
 @dataclass
 class VectorStore:
     nn: Optional[NearestNeighbors] = None
     texts: List[str] = None
-    embeddings: Optional[np.ndarray] = None
+    vectors: Optional[np.ndarray] = None
 
-VS = VectorStore(nn=None, texts=[], embeddings=None)
-
-def _ensure_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMB_MODEL_NAME)
+VS = VectorStore(nn=None, texts=[], vectors=None)
 
 def _chunk(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
     words = text.split()
@@ -49,6 +42,23 @@ def _chunk(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
         out.append(" ".join(words[i:i+chunk_size]))
         i += step
     return out
+
+def _embed_texts(texts: List[str]) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 1536), dtype="float32")
+    client = get_client()
+    out = []
+    # embed in small batches to avoid token limits
+    B = 64
+    for i in range(0, len(texts), B):
+        batch = texts[i:i+B]
+        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        vecs = [np.array(d.embedding, dtype="float32") for d in resp.data]
+        out.extend(vecs)
+    # normalize for cosine similarity
+    X = np.vstack(out)
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    return X
 
 def build_index_from_pdfs(files: List[gr.File]) -> str:
     all_text = []
@@ -59,28 +69,25 @@ def build_index_from_pdfs(files: List[gr.File]) -> str:
             if t.strip():
                 all_text.append(t)
     if not all_text:
-        VS.nn, VS.texts, VS.embeddings = None, [], None
+        VS.nn, VS.texts, VS.vectors = None, [], None
         return "No text found."
 
-    _ensure_embedder()
     chunks = _chunk("\n".join(all_text))
-    embs = _embedder.encode(chunks, normalize_embeddings=True)
-    # cosine sim via brute-force (metric='cosine' with 1 - cosine distance)
+    vectors = _embed_texts(chunks)
     nn = NearestNeighbors(n_neighbors=4, metric="cosine")
-    nn.fit(embs)
+    nn.fit(vectors)
 
-    VS.nn, VS.texts, VS.embeddings = nn, chunks, embs
+    VS.nn, VS.texts, VS.vectors = nn, chunks, vectors
     return f"Indexed {len(chunks)} chunks."
 
 def search_ctx(q: str, k: int = 4) -> List[str]:
     if VS.nn is None or not VS.texts:
         return []
-    _ensure_embedder()
-    qemb = _embedder.encode([q], normalize_embeddings=True)
-    distances, indices = VS.nn.kneighbors(qemb, n_neighbors=min(k, len(VS.texts)))
-    return [VS.texts[i] for i in indices[0]]
+    qvec = _embed_texts([q])
+    dist, idx = VS.nn.kneighbors(qvec, n_neighbors=min(k, len(VS.texts)))
+    return [VS.texts[i] for i in idx[0]]
 
-# ----- Chat logic -----
+# ---------- Chat logic ----------
 def system_prompt(domain: str) -> str:
     s = "You are a helpful teaching assistant. Be concise; show steps when asked."
     if domain.strip():
@@ -115,10 +122,10 @@ def chat_response(user_msg, history, use_rag, domain, model, temperature):
     return history, ""
 
 def clear_index():
-    VS.nn, VS.texts, VS.embeddings = None, [], None
+    VS.nn, VS.texts, VS.vectors = None, [], None
     return "Index cleared."
 
-# ----- UI -----
+# ---------- UI ----------
 with gr.Blocks(title="Course Chatbot (RAG + OpenAI)") as demo:
     gr.Markdown("# 🧠 Course Chatbot\nUpload PDFs and ask questions.")
 
@@ -127,7 +134,7 @@ with gr.Blocks(title="Course Chatbot (RAG + OpenAI)") as demo:
         model = gr.Dropdown(choices=["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], value="gpt-4o-mini", label="Model")
         temp = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Temperature")
 
-    domain = gr.Textbox(label="Domain focus (e.g., Logistic Regression, LDA, Metrics)", value="")
+    domain = gr.Textbox(label="Domain focus (e.g., Logistic Regression, LDA, Metrics)")
     use_rag = gr.Checkbox(label="Use PDF knowledge (RAG)", value=True)
 
     with gr.Accordion("📄 Upload PDFs for RAG", open=False):
